@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  /* The workbench injects the base look — type, controls, colours, scrollbars —
+     before this runs, so a package only writes what is specific to itself.
+     Delete this block entirely and the app still looks like it belongs. */
+  main { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+  ul {
+    flex: 1; margin: 0; padding: 8px 12px; list-style: none;
+    overflow-y: auto; display: flex; flex-direction: column; gap: 2px;
+  }
+  li { padding: 4px 8px; border-radius: 6px; animation: in 160ms ease-out; }
+  li:nth-child(odd) { background: color-mix(in srgb, var(--wm-text) 4%, transparent); }
+  @keyframes in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  form {
+    display: flex; gap: 6px; padding: 8px 10px;
+    background: var(--wm-chrome);
+    box-shadow: inset 0 0.5px 0 var(--wm-hairline);
+  }
+  input { flex: 1; }
+</style>
+<main>
+  <ul id="lines"></ul>
+  <form id="form">
+    <input id="text" placeholder="say something…" autofocus />
+    <button>Send</button>
+  </form>
+</main>
+<script>
+  // `wm` is injected: call/send/post/onMessage, addressed to this window.
+  const lines = document.getElementById("lines");
+  const add = (text) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    lines.appendChild(li);
+    lines.scrollTop = lines.scrollHeight;
+  };
+
+  wm.onMessage((msg) => {
+    if (msg.type === "hello") (msg.lines || []).forEach(add);
+    if (msg.type === "said") add(msg.text);
+  });
+
+  document.getElementById("form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = document.getElementById("text");
+    if (!input.value) return;
+    wm.send("say", input.value);
+    input.value = "";
+  });
+</script>

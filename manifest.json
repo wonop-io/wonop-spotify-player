@@ -1,0 +1,37 @@
+{
+  "id": "spotify",
+  "apiVersion": 1,
+  "name": "Spotify",
+  "version": "0.1.0",
+  "description": "Build a Spotify integration in its own folder and own git repository. First research current official Spotify Web API requirements: OAuth PKCE, developer app/client ID and redirect URI, development-mode user restrictions, Premium and active device requirements. Reuse Wonop OAuth/vault/network APIs. Scope: connect/disconnect, status, now playing, devices, play/pause, next/previous, volume with minimal scopes and actionable errors. No audio streaming promises. USER RESTRICTION: NO TERMINAL OR SHELL USE, including by coding agents. Use supported file/development APIs only; stop and ask if blocked. Do not publish or push. Begin with feasibility and one small checked implementation step.",
+  "icon": "icon.svg",
+  "entry": "main.ts",
+  "ui": "ui/index.html",
+  "window": { "width": 520, "height": 360 },
+  "strictArgs": true,
+  "commands": {
+    "greet": {
+      "help": "say hello to someone",
+      "args": { "who": "string" },
+      "returns": { "said": "string" }
+    },
+    "history": {
+      "help": "everything a window has been told to say",
+      "returns": { "lines": "string[]" }
+    }
+  },
+  "inputs": {
+    "say": { "help": "text to show in the window" }
+  },
+  "outputs": {
+    "said": { "help": "everything this app has been told to say" }
+  },
+  "palette": [
+    {
+      "title": "Greet someone (spotify)",
+      "snippet": "await wm.apps.spotify.greet({ who: {who} })",
+      "args": [{ "name": "who", "type": "string", "default": "world" }]
+    }
+  ],
+  "permissions": {}
+}

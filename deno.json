@@ -1,0 +1,7 @@
+{
+  "tasks": {
+    "test": "deno test --allow-read --no-lock main.test.ts",
+    "check": "WONOP_RUNTIME_DIR=runtime scripts/check-package-api.sh .",
+    "ci": "deno task test && deno task check"
+  }
+}
