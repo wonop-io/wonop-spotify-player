@@ -3527,6 +3527,38 @@ interface Wm {
     run(snippet: string, args?: Record<string, unknown>): Promise<unknown>;
   };
 
+  perf: {
+    /** why was it slow: slowest and failed traces in a window, and what is unseen */
+    diagnose(opts?: { since?: number; until?: number; kind?: "turn" | "task" | "codeRun" | "packageCall" | "workbench" | "startup"; workspace?: string; task?: string; traceId?: string; limit?: number }): Promise<{ version: string; window: { sinceMs: number | null; untilMs: number }; coverage: { held: number; matched: number; oldestHeldMs: number | null; newestHeldMs: number | null; windowStartsBeforeMemory: boolean; files: { dir: string | null; retentionDays: number; enabled: boolean }; caveats: string[] }; findings: { observed: string; traceId: string; stage: string; stageMs: number; share: number }[]; slowest: { traceId: string; kind: string; name: string; startMs: number; durMs: number; outcome: string; kept: string; unattributedMs: number; droppedSpans: number; labels: Record<string, unknown>; links: { traceId: string; why: string }[]; stages: { name: string; parent: string; kind: string; durMs: number; selfMs: number; outcome: string; labels: Record<string, unknown> }[] }[]; failed: { traceId: string; kind: string; name: string; startMs: number; durMs: number; outcome: string; spans: { name: string; outcome: string; error: string | null }[] }[]; byKind: Record<string, { n: number; p50Ms: number; p95Ms: number; worstMs: number }>; ops: { name: string; owner: string; p50Ms: number; p95Ms: number; worstMs: number; n: number }[]; stalls: { n: number; worst: { atMs: number; gapMs: number; webview: string | null; before: unknown }[] }; live: { inflight: { name: string; owner: string; runningMs: number }[]; stalls60s: number; cpu: unknown; memoryMb: number | null }; sources: string[]; next: string[] }>;
+
+    /** a trace and the ops table as redacted JSON, for a bug report */
+    export(opts?: { traceId?: string }): Promise<{ json: string }>;
+
+    /** what is running now, stalls in the last minute, core CPU and memory */
+    live(): Promise<{ inflight: { name: string; owner: string; runningMs: number }[]; stalls60s: number; cpu: { corePct: number | null; childrenPct: number | null }; memoryMb: number | null }>;
+
+    /** each operation's p50/p95/worst, owner and trend; frames, stalls, startup */
+    ops(): Promise<{ ops: { name: string; owner: string; p50Ms: number; p95Ms: number; worstMs: number; n: number; trend: number[] }[]; frames: unknown; stalls: unknown[]; resources: unknown[]; startup: Record<string, number> }>;
+
+    /** whether the live performance overlay is shown in the canvas corner */
+    overlay(): Promise<{ on: boolean }>;
+
+    /** show or hide the live performance overlay (no args toggles, like ⌥⌘P) */
+    setOverlay(opts?: { on?: boolean }): Promise<{ on: boolean }>;
+
+    /** person only: switch trace files on or off, or keep them 1-90 days */
+    setSettings(opts: { fileRecording?: boolean; retentionDays?: number }): Promise<{ fileRecording: boolean; retentionDays: number; dir: string | null }>;
+
+    /** whether kept traces are written to diagnostics/traces, and for how many days */
+    settings(): Promise<{ fileRecording: boolean; retentionDays: number; dir: string | null }>;
+
+    /** one kept trace with every span; not_found once it has left memory */
+    trace(opts: { traceId: string }): Promise<{ traceId: string; name: string; kind: string; startMs: number; durMs: number; outcome: string; labels: Record<string, unknown>; spans: { traceId: string; spanId: string; parent: string | null; name: string; kind: string; startMs: number; durMs: number; outcome: string; labels: Record<string, unknown> }[]; links: { traceId: string; why: string }[]; unattributedMs: number }>;
+
+    /** kept traces, newest first: slow, failed and one in ten of the rest */
+    traces(opts?: { since?: number; kind?: "turn" | "task" | "codeRun" | "packageCall" | "workbench" | "startup"; lane?: string; workspace?: string; slowOnly?: boolean; errorsOnly?: boolean; limit?: number }): Promise<{ traces: { traceId: string; name: string; kind: string; startMs: number; durMs: number; outcome: string; slowest: { name: string; durMs: number } | null; labels: Record<string, unknown> }[]; kept: { slow: number; errors: number; sampled: number }; files: { dir: string | null; retentionDays: number; enabled: boolean } }>;
+  };
+
   permissions: {
     /** person only: allow one named request; scope defaults to once */
     approve(opts: { id?: string; jobId?: string; scope?: PermissionScopeName }): Promise<PermissionDecision>;

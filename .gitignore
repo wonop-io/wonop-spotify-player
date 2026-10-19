@@ -1,2 +1,6 @@
 .DS_Store
 node_modules/
+# Local visual captures and diagnostic notes are not publication assets.
+spotify-current.png
+spotify-review.png
+performance-diagnostics-kickoff.md

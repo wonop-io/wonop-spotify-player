@@ -219,6 +219,15 @@ interface ExecResult {
   stdout: string;
   stderr: string;
 }
+
+/**
+ * What a media surface tells its package (WON-700): `message` (`data`, what
+ * the surface sent with `wonop.post`), `error` (`code`: `surface_script`,
+ * `token_refused`, `surface_lost`; and `message`), and `closed` (`reason`:
+ * `closed`, `window_closed`, `package_stopped`, `surface_lost`), always last.
+ */
+type SurfaceEvent = { type: string; [key: string]: unknown };
+
 interface FetchResult {
   status: number;
   headers: Record<string, string>;
@@ -614,7 +623,21 @@ interface AppApi {
     connect(name: string, opts?: { scopes?: string[] }): Promise<{ connected: boolean; scope?: string }>;
     status(
       name: string,
-    ): Promise<{ connected: boolean; expiresAt?: number; scope?: string; canRefresh?: boolean }>;
+    ): Promise<{
+      connected: boolean;
+      expiresAt?: number;
+      scope?: string;
+      canRefresh?: boolean;
+      /** Which client a connect would use: the person's own or Wonop's. */
+      client?: string | null;
+      /** Whether Wonop ships a client for this provider. */
+      builtin?: boolean;
+      /**
+       * The callback to register with the provider, exactly: the manifest's
+       * fixed `redirectUri`, or null when the listener takes any free port.
+       */
+      redirectUri?: string | null;
+    }>;
     /** Revokes at the provider when the manifest names a `revokeUrl`, then forgets the tokens. */
     disconnect(name: string): Promise<{ connected: false; revoked: boolean; remoteError?: string }>;
   };
@@ -845,6 +868,27 @@ interface AppApi {
       playing?: boolean;
     }): void;
     clear(): void;
+  };
+
+  /**
+   * The package's media surface (WON-700); requires `permissions.mediaSurface`.
+   * A hidden webview on the `https` start page the manifest names, running the
+   * package's surface script beside Wonop's `wonop` bridge, held by WebKit to
+   * the declared hosts and refused IPC. For web SDKs that play DRM-protected
+   * streams. See the `media-surface` docs topic.
+   */
+  mediaSurface: {
+    /** Opens for one of this package's windows and closes with it. */
+    open(opts: { windowId: string }): Promise<{ handle: string }>;
+    /** To the surface's `wonop.onMessage`; any JSON value up to 64 KB. */
+    post(handle: string, message: unknown): Promise<{ ok: boolean }>;
+    /** From a real click in the surface's window, at once; otherwise `gesture_required`. */
+    activateFromTrustedGesture(handle: string): Promise<{ ok: boolean }>;
+    state(handle: string): { handle: string; status: "loading" | "open" | "closed"; windowId: string; activated: boolean };
+    /** Waits up to 20 s for at least one event. */
+    events(handle: string): Promise<SurfaceEvent[]>;
+    onEvent(handle: string, listener: (event: SurfaceEvent) => void): () => void;
+    close(handle: string): Promise<{ ok: boolean }>;
   };
 
   /**
