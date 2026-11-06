@@ -13,27 +13,46 @@ async function assertRejects(fn: () => Promise<unknown>, code: string, text: str
   throw new Error("Expected command to reject");
 }
 
-async function harness(options: { connected?: boolean; responses?: Array<{ status: number; body?: string }>; activationError?: { code: string; message: string } } = {}) {
+const FULL_SCOPE = "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private";
+const BASE_SCOPE = "user-read-playback-state user-modify-playback-state";
+
+async function harness(options: {
+  connected?: boolean;
+  scope?: string;
+  connectScope?: string;
+  fetchError?: { code: string; message: string };
+  responses?: Array<{ status: number; body?: string }>;
+  activationError?: { code: string; message: string };
+} = {}) {
   const requests: any[] = [];
   const posts: any[] = [];
   const activations: string[] = [];
   const surfacePosts: any[] = [];
+  const opens: any[] = [];
+  const connects: any[] = [];
+  const auth = { connected: options.connected ?? true, scope: options.scope ?? FULL_SCOPE };
   let surfaceListener: ((event: any) => void) | null = null;
   const responses = [...(options.responses ?? [])];
-  const h: any = { spec: null, requests, posts, activations, surfacePosts };
+  const h: any = { spec: null, requests, posts, activations, surfacePosts, opens, connects, auth };
   (globalThis as any).app = {
     define(spec: any) { h.spec = spec; },
     oauth: {
-      status: async () => ({ connected: options.connected ?? true, redirectUri: "http://127.0.0.1:8888/callback", scope: "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private" }),
-      connect: async () => ({ connected: true, scope: "user-read-playback-state user-modify-playback-state" }),
+      status: async () => ({ connected: auth.connected, redirectUri: "http://127.0.0.1:8888/callback", scope: auth.scope }),
+      connect: async (name: string, opts?: any) => {
+        connects.push({ name, opts });
+        auth.connected = true;
+        auth.scope = options.connectScope ?? auth.scope;
+        return { connected: true, scope: auth.scope };
+      },
       disconnect: async () => ({ connected: false, revoked: false }),
     },
     fetch: async (url: string, init: any) => {
       requests.push({ url, init });
+      if (options.fetchError) throw Object.assign(new Error(options.fetchError.message), { code: options.fetchError.code });
       return responses.shift() ?? { status: 204 };
     },
     mediaSurface: {
-      open: async () => ({ handle: "surface-1" }),
+      open: async (opts: any) => { opens.push(opts); return { handle: "surface-1" }; },
       post: async (_handle: string, message: any) => { surfacePosts.push(message); return { ok: true }; },
       activateFromTrustedGesture: async (handle: string) => {
         activations.push(handle);
@@ -232,4 +251,116 @@ Deno.test("audio diagnostics surface sanitized failures", async () => {
 Deno.test("audio diagnostics reject when the surface is unavailable", async () => {
   const h = await harness();
   await assertRejects(() => h.spec.commands.audioDiagnostics(), "not_found", "not ready");
+});
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const surfaceStatuses = (h: any) => h.posts.map((post: any) => post.payload?.surface?.status).filter(Boolean);
+
+// WON-874: open, start or activate the player when Spotify connects.
+
+Deno.test("connect asks for playback scopes and starts the in-Wonop player", async () => {
+  const h = await harness({ connected: false, scope: "", connectScope: FULL_SCOPE });
+  const result = await h.spec.commands.connect({}, { windowId: "p1", hostId: "p1", caller: "window" });
+  assertEquals(h.connects, [{ name: "spotify", opts: { scopes: ["streaming", "user-read-email", "user-read-private"] } }]);
+  assertEquals(h.opens, [{ windowId: "p1" }]);
+  assertEquals(result, { connected: true, scope: FULL_SCOPE, player: "opening" });
+  h.surfaceEvent({ type: "message", data: { type: "ready", deviceId: "sdk-device" } });
+  assertEquals((await h.spec.commands.surfaceStatus()).surface.deviceReady, true);
+});
+
+Deno.test("connect from an agent starts the player in the open Spotify window", async () => {
+  const h = await harness({ scope: BASE_SCOPE, connectScope: FULL_SCOPE });
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  assertEquals(h.opens, []);
+  const result = await h.spec.commands.connect({}, { windowId: null, hostId: null, caller: "agent" });
+  assertEquals(h.opens, [{ windowId: "p1" }]);
+  assertEquals(result.player, "opening");
+});
+
+Deno.test("consent granted later starts the player without a restart", async () => {
+  const h = await harness({ scope: BASE_SCOPE, connectScope: FULL_SCOPE });
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  assertEquals(surfaceStatuses(h).at(-1), "needs-consent");
+  const result = await h.spec.commands.enablePlayback({}, { windowId: null, hostId: null, caller: "agent" });
+  assertEquals(h.opens, [{ windowId: "p1" }]);
+  assertEquals(result.player, "opening");
+});
+
+// WON-874: point to consent or activation before the device is ready.
+
+Deno.test("play before playback consent points to Enable playback", async () => {
+  const h = await harness({ scope: BASE_SCOPE });
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  h.spec.onMessage({ payload: { type: "surface-play", uri: "spotify:track:t1", trace: { id: "a1" } }, windowId: "p1" });
+  await tick();
+  const error = h.posts.map((post: any) => post.payload?.surface).find((surface: any) => surface?.status === "play-error");
+  assertEquals([error.code, error.action], ["needs_consent", "enable-playback"]);
+  if (!error.message.includes("Enable playback")) throw new Error(`Consent step not named: ${error.message}`);
+  assertEquals(h.activations, []);
+  assertEquals(h.requests.filter((request: any) => request.url.includes("/me/player/play")), []);
+});
+
+Deno.test("play while the player starts says so instead of failing silently", async () => {
+  const h = await harness();
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  h.spec.onMessage({ payload: { type: "surface-play", uri: "spotify:track:t1", trace: { id: "a2" } }, windowId: "p1" });
+  await tick();
+  const error = h.posts.map((post: any) => post.payload?.surface).find((surface: any) => surface?.status === "play-error");
+  assertEquals(error.code, "starting");
+  if (!error.message.includes("Press Play again")) throw new Error(`No next step: ${error.message}`);
+  assertEquals(h.activations, []);
+  const attempt = (await h.spec.commands.surfaceStatus()).surface.lastPlayAttempt;
+  assertEquals(attempt.stage, "readiness-rejected");
+});
+
+Deno.test("play reopens a closed player when every grant is in place", async () => {
+  const h = await harness();
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  h.surfaceEvent({ type: "closed", reason: "crashed" });
+  h.spec.onMessage({ payload: { type: "surface-play", uri: "spotify:track:t1", trace: { id: "a3" } }, windowId: "p1" });
+  await tick();
+  assertEquals(h.opens, [{ windowId: "p1" }, { windowId: "p1" }]);
+});
+
+// WON-874: a clear Connect prompt when a call fails with `unauthorized`.
+
+Deno.test("an unauthorized fetch becomes a Connect prompt", async () => {
+  const h = await harness({ fetchError: { code: "unauthorized", message: "refresh refused" } });
+  await assertRejects(() => h.spec.commands.devices(), "unauthorized", "Connect Spotify");
+  const prompt = h.posts.find((post: any) => post.payload?.type === "error");
+  assertEquals([prompt.payload.code, prompt.payload.action, prompt.windowId], ["unauthorized", "connect", undefined]);
+});
+
+Deno.test("Home does not hide a lost sign-in behind empty sections", async () => {
+  const h = await harness({ fetchError: { code: "unauthorized", message: "refresh refused" } });
+  await assertRejects(() => h.spec.commands.home(), "unauthorized", "Connect Spotify");
+});
+
+Deno.test("Spotify's 401 also asks the person to connect again", async () => {
+  const h = await harness({ responses: [{ status: 401, body: JSON.stringify({ error: { message: "The access token expired" } }) }] });
+  await assertRejects(() => h.spec.commands.nowPlaying(), "unauthorized", "Connect Spotify");
+});
+
+Deno.test("an unauthorized play tells the window to show Connect", async () => {
+  const h = await harness({ fetchError: { code: "unauthorized", message: "refresh refused" } });
+  await h.spec.onOpen({ windowId: "p1" });
+  await tick();
+  h.surfaceEvent({ type: "message", data: { type: "ready", deviceId: "sdk-device" } });
+  h.spec.onMessage({ payload: { type: "surface-play", uri: "spotify:track:t1", trace: { id: "a4" } }, windowId: "p1" });
+  await tick();
+  const error = h.posts.map((post: any) => post.payload?.surface).find((surface: any) => surface?.status === "play-error");
+  assertEquals([error.code, error.action], ["unauthorized", "connect"]);
+  const state = h.posts.find((post: any) => post.payload?.type === "error" && post.windowId === "p1");
+  assertEquals(state.payload.code, "unauthorized");
+});
+
+Deno.test("another fetch failure is not mistaken for a lost sign-in", async () => {
+  const h = await harness({ fetchError: { code: "timeout", message: "slow network" } });
+  await assertRejects(() => h.spec.commands.devices(), "timeout", "slow network");
+  assertEquals(h.posts.filter((post: any) => post.payload?.code === "unauthorized"), []);
 });
