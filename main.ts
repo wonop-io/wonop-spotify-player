@@ -39,10 +39,31 @@ let lastPlayAttempt: any = null;
 let nextSurfaceRequestId = 1;
 const pendingSurfaceRequests = new Map<number, { resolve: (value: any) => void; reject: (error: any) => void; timer: any }>();
 
-function fail(code: "invalid_args" | "not_found" | "forbidden", message: string): never {
+type FailCode = "invalid_args" | "not_found" | "forbidden" | "unauthorized" | "needs_consent" | "needs_approval" | "starting" | "unsupported";
+/** What the window should offer next: sign in, grant playback consent, or nothing. */
+type NextAction = "connect" | "enable-playback" | null;
+
+const CONNECT_MESSAGE = "Spotify needs you to sign in again. Choose Connect Spotify to continue.";
+
+function fail(code: FailCode, message: string, action: NextAction = null): never {
   const error: any = new Error(message);
   error.code = code;
+  if (action) error.action = action;
   throw error;
+}
+
+/** Tells every open window to show the Connect prompt, then rejects with `unauthorized`. */
+function signInNeeded(): never {
+  app.ui.post({ type: "error", code: "unauthorized", action: "connect", message: CONNECT_MESSAGE });
+  fail("unauthorized", CONNECT_MESSAGE, "connect");
+}
+
+/** A fallback for a best-effort call that still lets a lost sign-in through. */
+function softFail<T>(fallback: T): (error: any) => T {
+  return (error: any) => {
+    if (error?.code === "unauthorized") throw error;
+    return fallback;
+  };
 }
 
 function parse(body?: string): any {
@@ -57,7 +78,7 @@ function providerMessage(status: number, body?: string): string {
 
 function actionable(status: number, body?: string): never {
   const detail = providerMessage(status, body);
-  if (status === 401) fail("forbidden", "Spotify authorization expired. Disconnect and connect again.");
+  if (status === 401) signInNeeded();
   if (status === 403) fail("forbidden", `${detail}. Check that this account is allowed to use the Spotify developer app and that the app owner has Premium.`);
   if (status === 404) fail("not_found", "No controllable Spotify Connect device is available. Open Spotify on a device and start playback once.");
   if (status === 429) fail("forbidden", "Spotify is rate limiting this app. Wait before trying again.");
@@ -66,7 +87,7 @@ function actionable(status: number, body?: string): never {
 
 async function requireConnection(): Promise<void> {
   const state = await app.oauth.status("spotify");
-  if (!state.connected) fail("forbidden", "Connect your Spotify account first.");
+  if (!state.connected) fail("unauthorized", "Connect your Spotify account first.", "connect");
 }
 
 async function spotify(path: string, init: { method?: string; body?: string } = {}): Promise<any> {
@@ -76,7 +97,15 @@ async function spotify(path: string, init: { method?: string; body?: string } = 
     auth: "spotify",
   };
   if (init.body) request.headers = { "Content-Type": "application/json" };
-  const response = await app.fetch(`${API}${path}`, request);
+  let response: FetchResult;
+  try {
+    response = await app.fetch(`${API}${path}`, request);
+  } catch (error: any) {
+    // Wonop throws `unauthorized` when the token refresh is refused or the
+    // account is no longer connected (desktop 0.2.61, WON-874).
+    if (error?.code === "unauthorized") signInNeeded();
+    throw error;
+  }
   if (response.status >= 200 && response.status < 300) return parse(response.body);
   actionable(response.status, response.body);
 }
@@ -300,6 +329,47 @@ async function openSurface(windowId: string): Promise<void> {
   }
 }
 
+/**
+ * Why Play cannot reach the embedded player yet, with the step that fixes it,
+ * or null when the device is ready. Connected is not the same as ready.
+ */
+async function playerBlocker(): Promise<{ code: FailCode; message: string; action: NextAction } | null> {
+  const auth = await app.oauth.status("spotify");
+  if (!auth.connected || lastSurfaceEvent?.status === "signin-needed") {
+    return { code: "unauthorized", message: CONNECT_MESSAGE, action: "connect" };
+  }
+  if (!hasSurfaceScopes(auth.scope)) {
+    return {
+      code: "needs_consent",
+      message: "Spotify needs your one-time permission to play inside Wonop. Choose Enable playback, accept in Spotify, then press Play again.",
+      action: "enable-playback",
+    };
+  }
+  if (lastSurfaceEvent?.status === "needs-approval") {
+    return { code: "needs_approval", message: "Wonop has not approved this package's Spotify player yet. Approve the Spotify package's media permission in Wonop, then press Play again.", action: null };
+  }
+  if (lastSurfaceEvent?.status === "player-error" && lastSurfaceEvent?.kind === "account_error") {
+    return { code: "unsupported", message: "This Spotify account cannot play inside Wonop. Embedded playback needs Spotify Premium and an account allowed to use this Spotify app.", action: null };
+  }
+  if (!surfaceHandle || !surfaceDeviceId) {
+    // Ready is checked by the caller; reaching here means the device is not up yet.
+    return { code: "starting", message: "The Spotify player in Wonop is still starting. Press Play again in a moment.", action: null };
+  }
+  return null;
+}
+
+/**
+ * Opens the embedded player for a window so a device is ready right after
+ * sign-in or consent, without a restart. Answers where readiness stands.
+ */
+async function startPlayer(windowId?: string | null): Promise<string> {
+  const target = windowId || surfaceWindowId;
+  if (!target) return "no-window";
+  await openSurface(target);
+  if (surfaceDeviceId) return "ready";
+  return typeof lastSurfaceEvent?.status === "string" ? lastSurfaceEvent.status : "opening";
+}
+
 async function surfaceCommand(cmd: string, args: any = {}): Promise<void> {
   if (!surfaceHandle) fail("not_found", "The in-Wonop Spotify player is not ready.");
   await app.mediaSurface.post(surfaceHandle, { id: Date.now(), cmd, args });
@@ -329,14 +399,22 @@ function recordPlayStage(stage: string, trace: any = {}, detail: any = {}): void
 async function playInsideWonop(uri: string, trace: any = {}): Promise<void> {
   let phase = "readiness";
   try {
-    if (!surfaceHandle || !surfaceDeviceId) fail("not_found", "The in-Wonop Spotify player is not ready yet.");
+    // A ready device goes straight to activation: an extra await here could
+    // outlive the click that `activateFromTrustedGesture` needs.
+    const blocker = surfaceHandle && surfaceDeviceId ? null : await playerBlocker();
+    if (blocker) {
+      if (blocker.code === "needs_consent") postSurface({ status: "needs-consent", requiredScopes: SURFACE_SCOPES });
+      // A closed player with every grant in place is started now, so the next Play has a device.
+      if (blocker.code === "starting" && !surfaceHandle && surfaceWindowId) void openSurface(surfaceWindowId);
+      fail(blocker.code, blocker.message, blocker.action);
+    }
     phase = "activation";
     recordPlayStage("activation-requested", trace);
-    await app.mediaSurface.activateFromTrustedGesture(surfaceHandle);
+    await app.mediaSurface.activateFromTrustedGesture(surfaceHandle!);
     recordPlayStage("activation-accepted", trace);
     phase = "spotify-api";
     recordPlayStage("api-requested", trace);
-    await spotify(`/me/player/play?device_id=${encodeURIComponent(surfaceDeviceId)}`, {
+    await spotify(`/me/player/play?device_id=${encodeURIComponent(surfaceDeviceId!)}`, {
       method: "PUT",
       body: JSON.stringify({ uris: [uri] }),
     });
@@ -376,20 +454,23 @@ async function postState(windowId?: string): Promise<void> {
     ]);
     app.ui.post({ type: "state", connected: true, playback, devices: deviceData?.devices ?? [] }, windowId);
   } catch (error: any) {
-    app.ui.post({ type: "error", message: error?.message ?? "Spotify request failed." }, windowId);
+    app.ui.post({ type: "error", code: error?.code ?? null, action: error?.action ?? null, message: error?.message ?? "Spotify request failed." }, windowId);
   }
 }
 
 app.define({
   commands: {
-    async connect() {
-      const result = await app.oauth.connect("spotify");
-      return { connected: result.connected, scope: result.scope };
-    },
-    async enablePlayback(_args: any, ctx: any) {
+    async connect(_args: any, ctx: CommandCtx) {
+      // Ask for the embedded-player scopes in the same sign-in, then start the
+      // player, so Play has a ready device straight after connecting.
       const result = await app.oauth.connect("spotify", { scopes: SURFACE_SCOPES });
-      if (result.connected && ctx?.windowId) await openSurface(ctx.windowId);
-      return { connected: result.connected, scope: result.scope };
+      const player = result.connected ? await startPlayer(ctx?.windowId) : "not-connected";
+      return { connected: result.connected, scope: result.scope, player };
+    },
+    async enablePlayback(_args: any, ctx: CommandCtx) {
+      const result = await app.oauth.connect("spotify", { scopes: SURFACE_SCOPES });
+      const player = result.connected ? await startPlayer(ctx?.windowId) : "not-connected";
+      return { connected: result.connected, scope: result.scope, player };
     },
     async enableLibrary() {
       const result = await app.oauth.connect("spotify", { scopes: LIBRARY_SCOPES });
@@ -427,10 +508,10 @@ app.define({
     },
     async home() {
       const [playlists, featured, recent, top] = await Promise.all([
-        spotify("/me/playlists?limit=8").catch(() => ({ items: [], error: true })),
-        spotify("/browse/featured-playlists?limit=8").catch(() => ({ playlists: { items: [] }, error: true })),
-        spotify("/me/player/recently-played?limit=8").catch(() => ({ items: [], error: true })),
-        spotify("/me/top/tracks?limit=8&time_range=medium_term").catch(() => ({ items: [], error: true })),
+        spotify("/me/playlists?limit=8").catch(softFail<any>({ items: [], error: true })),
+        spotify("/browse/featured-playlists?limit=8").catch(softFail<any>({ playlists: { items: [] }, error: true })),
+        spotify("/me/player/recently-played?limit=8").catch(softFail<any>({ items: [], error: true })),
+        spotify("/me/top/tracks?limit=8&time_range=medium_term").catch(softFail<any>({ items: [], error: true })),
       ]);
       const recentTracks = (recent?.items ?? []).map((entry: any) => simplifyTrack(entry?.track)).filter(Boolean);
       const topTracks = (top?.items ?? []).map(simplifyTrack).filter(Boolean);
@@ -568,6 +649,7 @@ app.define({
       void playInsideWonop(payload.uri, trace).catch((error: any) => postSurface({
         status: "play-error",
         code: error?.code,
+        action: error?.action ?? null,
         message: error?.code === "gesture_required"
           ? "Playback needs your direct click on Play. Automated clicks cannot unlock protected audio."
           : error?.message,
